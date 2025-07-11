@@ -1,0 +1,1613 @@
+import React, { useState, useEffect, createContext, useContext } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, onAuthStateChanged, signOut, signInAnonymously, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot, collection, addDoc, query, getDocs } from 'firebase/firestore';
+import { getStorage, ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+
+// --- Firebase Initialization & Context ---
+// Global variables provided by the Canvas environment
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const storage = getStorage(app);
+
+const AuthContext = createContext(null);
+
+const AuthProvider = ({ children }) => {
+  const [currentUser, setCurrentUser] = useState(null);
+  const [currentUserProfile, setCurrentUserProfile] = useState(null);
+  const [loadingAuth, setLoadingAuth] = useState(true);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        setCurrentUser(user);
+        const userDocRef = doc(db, 'users', user.uid);
+        // Listen for real-time updates to the user profile
+        onSnapshot(userDocRef, (docSnap) => {
+          if (docSnap.exists()) {
+            setCurrentUserProfile(docSnap.data());
+          } else {
+            console.warn("No user profile found for existing user. This might indicate an issue or a new anonymous user.");
+            setCurrentUserProfile(null); // Clear profile if it somehow disappears
+          }
+          setLoadingAuth(false);
+        }, (error) => {
+          console.error("Error fetching user profile:", error);
+          setLoadingAuth(false);
+        });
+      } else {
+        setCurrentUser(null);
+        setCurrentUserProfile(null);
+        // Attempt anonymous sign-in if no user and no custom token provided, or if custom token fails
+        if (initialAuthToken) {
+          try {
+            await signInWithCustomToken(auth, initialAuthToken);
+            console.log("Signed in with custom token.");
+          } catch (error) {
+            console.error("Error signing in with custom token:", error);
+            try {
+              await signInAnonymously(auth);
+              console.log("Signed in anonymously as fallback.");
+            } catch (anonError) {
+              console.error("Error signing in anonymously:", anonError);
+            } finally {
+              setLoadingAuth(false);
+            }
+          }
+        } else {
+          try {
+            await signInAnonymously(auth);
+            console.log("Signed in anonymously.");
+          } catch (anonError) {
+            console.error("Error signing in anonymously:", anonError);
+          } finally {
+            setLoadingAuth(false);
+          }
+        }
+      }
+    });
+
+    return () => unsubscribe();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const value = { currentUser, currentUserProfile, loadingAuth, auth, db, storage };
+  return (
+    <AuthContext.Provider value={value}>
+      {children}
+    </AuthContext.Provider>
+  );
+};
+
+const useAuth = () => {
+  return useContext(AuthContext);
+};
+
+// --- Components ---
+
+// Message Box Component for user feedback
+const MessageBox = ({ message, type }) => {
+  const [isVisible, setIsVisible] = useState(false);
+  const bgColor = type === 'error' ? 'bg-red-600' : (type === 'info' ? 'bg-blue-600' : 'bg-green-600');
+
+  useEffect(() => {
+    if (message) {
+      setIsVisible(true);
+      const timer = setTimeout(() => {
+        setIsVisible(false);
+      }, 3000); // Message disappears after 3 seconds
+      return () => clearTimeout(timer);
+    }
+  }, [message, type]);
+
+  if (!isVisible) return null;
+
+  return (
+    <div className={`fixed top-4 right-4 p-4 rounded-lg shadow-lg text-white ${bgColor} z-50 transition-opacity duration-500`}>
+      {message}
+    </div>
+  );
+};
+
+// Authentication Component (Login/Signup)
+const AuthPage = ({ showMessage }) => {
+  const { auth, db } = useAuth();
+  const [isLogin, setIsLogin] = useState(true);
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [role, setRole] = useState('client');
+  const [barnName, setBarnName] = useState('');
+
+  const handleAuth = async (e) => {
+    e.preventDefault();
+    try {
+      if (isLogin) {
+        await signInWithEmailAndPassword(auth, email, password);
+        showMessage('Logged in successfully!', 'success');
+      } else {
+        const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+        const user = userCredential.user;
+        let barnIdToUse = null;
+
+        if (role === 'barn_owner') {
+          barnIdToUse = `${user.uid}_${Date.now()}`; // Unique ID for barn
+          await setDoc(doc(db, 'barns', barnIdToUse), {
+            name: barnName || `${user.email.split('@')[0]}'s Barn`,
+            ownerUid: user.uid,
+            createdAt: new Date()
+          });
+          showMessage(`Welcome, Barn Owner! Your barn '${barnName}' is set up.`, 'success');
+        } else {
+          barnIdToUse = 'demo_barn_id'; // Generic ID for demo clients/staff
+          showMessage(`Welcome, ${role}!`, 'success');
+        }
+
+        // Create user profile in Firestore
+        await setDoc(doc(db, 'users', user.uid), {
+          email: user.email,
+          role: role,
+          barnId: barnIdToUse,
+          createdAt: new Date(),
+          subscriptionStatus: 'free', // Default to free tier
+          name: '', // Initialize name for profile
+          bio: '',
+          location: '',
+          preferredDiscipline: '',
+          ridingLevel: '',
+          profileImageUrl: ''
+        });
+        showMessage('Account created successfully!', 'success');
+      }
+    } catch (error) {
+      console.error('Auth error:', error);
+      showMessage(`Authentication failed: ${error.message}`, 'error');
+    }
+  };
+
+  return (
+    <div className="flex flex-col items-center justify-center h-full w-full">
+      <div className="bg-white p-8 rounded-xl shadow-md w-full max-w-md">
+        <h2 className="text-2xl font-bold text-[#8B4513] mb-6 text-center">Welcome to Stabled</h2>
+        
+        <div className="mb-8">
+          <h3 className="text-xl font-semibold text-gray-800 mb-4">{isLogin ? 'Login' : 'Sign Up'}</h3>
+          <form onSubmit={handleAuth} className="space-y-4">
+            <div>
+              <label htmlFor="email" className="block text-sm font-medium text-gray-700">Email</label>
+              <input type="email" id="email" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-[#D2691E] focus:ring-[#D2691E] sm:text-sm p-2" value={email} onChange={(e) => setEmail(e.target.value)} required />
+            </div>
+            <div>
+              <label htmlFor="password" className="block text-sm font-medium text-gray-700">Password</label>
+              <input type="password" id="password" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-[#D2691E] focus:ring-[#D2691E] sm:text-sm p-2" value={password} onChange={(e) => setPassword(e.target.value)} required />
+            </div>
+            {!isLogin && (
+              <>
+                <div>
+                  <label htmlFor="role" className="block text-sm font-medium text-gray-700">I am a...</label>
+                  <select id="role" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-[#D2691E] focus:ring-[#D2691E] sm:text-sm p-2" value={role} onChange={(e) => setRole(e.target.value)}>
+                    <option value="barn_owner">Barn Owner</option>
+                    <option value="client">Client</option>
+                    <option value="staff">Staff</option>
+                  </select>
+                </div>
+                {role === 'barn_owner' && (
+                  <div>
+                    <label htmlFor="barnName" className="block text-sm font-medium text-gray-700">Barn Name (for owners)</label>
+                    <input type="text" id="barnName" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-[#D2691E] focus:ring-[#D2691E] sm:text-sm p-2" value={barnName} onChange={(e) => setBarnName(e.target.value)} required={role === 'barn_owner'} />
+                  </div>
+                )}
+              </>
+            )}
+            <button type="submit" className="w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-[#D2691E] hover:bg-[#A0522D] focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-[#D2691E]">
+              {isLogin ? 'Login' : 'Sign Up'}
+            </button>
+          </form>
+        </div>
+        <button onClick={() => setIsLogin(!isLogin)} className="w-full text-center text-sm text-blue-600 hover:underline mt-4">
+          {isLogin ? 'Need an account? Sign Up' : 'Already have an account? Login'}
+        </button>
+      </div>
+    </div>
+  );
+};
+
+// Horse Management Component
+const HorseManagement = ({ showMessage }) => {
+  const { currentUser, currentUserProfile, db, storage } = useAuth();
+  const [horses, setHorses] = useState([]);
+  const [newHorse, setNewHorse] = useState({
+    name: '', breed: '', discipline: [], age: '', sex: '', color: '', owner: '', image: null, imageUrl: ''
+  });
+  const [editingHorseId, setEditingHorseId] = useState(null);
+
+  useEffect(() => {
+    if (currentUser && currentUserProfile?.barnId) {
+      const q = query(collection(db, `barns/${currentUserProfile.barnId}/horses`));
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const horsesData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setHorses(horsesData);
+      }, (error) => {
+        console.error("Error fetching horses:", error);
+        showMessage("Error loading horses.", "error");
+      });
+      return () => unsubscribe();
+    } else {
+      setHorses([]);
+    }
+  }, [currentUser, currentUserProfile, db, showMessage]);
+
+  const handleInputChange = (e) => {
+    const { name, value, type, files, options } = e.target;
+    if (type === 'file') {
+      setNewHorse({ ...newHorse, image: files[0], imageUrl: '' }); // Clear imageUrl when new file selected
+    } else if (type === 'select-multiple') {
+      const selectedOptions = Array.from(options).filter(option => option.selected).map(option => option.value);
+      setNewHorse({ ...newHorse, [name]: selectedOptions });
+    } else {
+      setNewHorse({ ...newHorse, [name]: value });
+    }
+  };
+
+  const handleImageUpload = async (file) => {
+    if (!file) return null;
+    const storageRef = ref(storage, `horse_images/${currentUser.uid}/${file.name}_${Date.now()}`);
+    await uploadBytes(storageRef, file);
+    return await getDownloadURL(storageRef);
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!currentUser || !currentUserProfile?.barnId) {
+      showMessage("Please log in and ensure your barn is set up.", "error");
+      return;
+    }
+
+    // Check free tier limit for horses
+    if (currentUserProfile.subscriptionStatus === 'free' && horses.length >= 1 && !editingHorseId) {
+      showMessage("Free tier is limited to 1 horse. Upgrade to Premium for unlimited horses.", "info");
+      return;
+    }
+
+    try {
+      let imageUrl = newHorse.imageUrl;
+      if (newHorse.image) {
+        imageUrl = await handleImageUpload(newHorse.image);
+      }
+
+      const horseData = { ...newHorse, image: null, imageUrl, userId: currentUser.uid };
+      if (editingHorseId) {
+        await setDoc(doc(db, `barns/${currentUserProfile.barnId}/horses`, editingHorseId), horseData, { merge: true });
+        showMessage('Horse updated successfully!', 'success');
+        setEditingHorseId(null);
+      } else {
+        await addDoc(collection(db, `barns/${currentUserProfile.barnId}/horses`), horseData);
+        showMessage('Horse added successfully!', 'success');
+      }
+      setNewHorse({ name: '', breed: '', discipline: [], age: '', sex: '', color: '', owner: '', image: null, imageUrl: '' });
+    } catch (error) {
+      console.error('Error saving horse:', error);
+      showMessage(`Failed to save horse: ${error.message}`, 'error');
+    }
+  };
+
+  const handleEdit = (horse) => {
+    setNewHorse({ ...horse, image: null }); // Don't pre-fill image input
+    setEditingHorseId(horse.id);
+  };
+
+  const handleDelete = async (id) => {
+    if (!currentUser || !currentUserProfile?.barnId) return;
+    if (window.confirm("Are you sure you want to delete this horse?")) {
+      try {
+        // In a real app, consider soft delete or moving to an archive collection
+        await setDoc(doc(db, `barns/${currentUserProfile.barnId}/horses`, id), { deleted: true }, { merge: true }); // Soft delete
+        showMessage('Horse deleted successfully!', 'success');
+      } catch (error) {
+        console.error('Error deleting horse:', error);
+        showMessage(`Failed to delete horse: ${error.message}`, 'error');
+      }
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <h2 className="text-3xl font-bold text-[#8B4513] mb-2">🐴 Horse Profiles</h2>
+      <p className="text-gray-500 mb-8">Manage detailed profiles for every horse at your barn.</p>
+
+      {currentUserProfile?.subscriptionStatus === 'free' && (
+        <div className="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-4 mb-4 rounded-md">
+          <p className="font-bold">Free Tier Limitation:</p>
+          <p>You can add up to 1 horse profile in the Free tier. Upgrade to Premium for unlimited horses.</p>
+        </div>
+      )}
+
+      <div className="bg-white p-6 rounded-xl shadow-md">
+        <h3 className="text-xl font-semibold text-gray-800 mb-3">{editingHorseId ? 'Edit Horse' : 'Add New Horse'}</h3>
+        <form onSubmit={handleSubmit} className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label htmlFor="name" className="block text-sm font-medium text-gray-700">Horse Name</label>
+            <input type="text" id="name" name="name" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newHorse.name} onChange={handleInputChange} required />
+          </div>
+          <div>
+            <label htmlFor="breed" className="block text-sm font-medium text-gray-700">Breed</label>
+            <input type="text" id="breed" name="breed" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newHorse.breed} onChange={handleInputChange} />
+          </div>
+          <div>
+            <label htmlFor="discipline" className="block text-sm font-medium text-gray-700">Discipline</label>
+            <select id="discipline" name="discipline" multiple className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 h-24" value={newHorse.discipline} onChange={handleInputChange}>
+              <option value="Dressage">Dressage</option>
+              <option value="Jumping">Jumping</option>
+              <option value="Western Pleasure">Western Pleasure</option>
+              <option value="Trail Riding">Trail Riding</option>
+              <option value="Eventing">Eventing</option>
+              <option value="Reining">Reining</option>
+              <option value="Endurance">Endurance</option>
+            </select>
+          </div>
+          <div>
+            <label htmlFor="age" className="block text-sm font-medium text-gray-700">Age</label>
+            <input type="number" id="age" name="age" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newHorse.age} onChange={handleInputChange} />
+          </div>
+          <div>
+            <label htmlFor="sex" className="block text-sm font-medium text-gray-700">Sex</label>
+            <select id="sex" name="sex" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newHorse.sex} onChange={handleInputChange}>
+              <option value="">Select</option>
+              <option value="Mare">Mare</option>
+              <option value="Stallion">Stallion</option>
+              <option value="Gelding">Gelding</option>
+            </select>
+          </div>
+          <div>
+            <label htmlFor="color" className="block text-sm font-medium text-gray-700">Color</label>
+            <input type="text" id="color" name="color" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newHorse.color} onChange={handleInputChange} />
+          </div>
+          <div className="md:col-span-2">
+            <label htmlFor="image" className="block text-sm font-medium text-gray-700">Horse Image</label>
+            <input type="file" id="image" name="image" accept="image/*" className="mt-1 block w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-[#F5DEB3] file:text-[#8B4513] hover:file:bg-[#EEDDBC]" onChange={handleInputChange} />
+            {newHorse.imageUrl && <img src={newHorse.imageUrl} alt="Horse Preview" className="mt-2 h-24 w-24 object-cover rounded-md" />}
+          </div>
+          <div className="md:col-span-2">
+            <button type="submit" className="w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-[#D2691E] hover:bg-[#A0522D]">
+              {editingHorseId ? 'Update Horse' : 'Add Horse'}
+            </button>
+            {editingHorseId && (
+              <button type="button" onClick={() => { setEditingHorseId(null); setNewHorse({ name: '', breed: '', discipline: [], age: '', sex: '', color: '', owner: '', image: null, imageUrl: '' }); }} className="w-full inline-flex justify-center py-2 px-4 border border-gray-300 shadow-sm text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50 mt-2">
+                Cancel Edit
+              </button>
+            )}
+          </div>
+        </form>
+      </div>
+
+      <div className="bg-white p-6 rounded-xl shadow-md">
+        <h3 className="text-xl font-semibold text-gray-800 mb-3">Your Horses</h3>
+        {horses.length === 0 ? (
+          <p className="text-gray-600">No horses added yet. Add one above!</p>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {horses.map(horse => (
+              <div key={horse.id} className="border rounded-lg p-4 bg-blue-50 flex items-center space-x-4">
+                {horse.imageUrl && <img src={horse.imageUrl} alt={horse.name} className="h-16 w-16 object-cover rounded-full" />}
+                <div className="flex-1">
+                  <p className="font-semibold text-blue-800">{horse.name}</p>
+                  <p className="text-sm text-blue-600">{horse.breed} | {horse.age} years | {horse.sex}</p>
+                  <p className="text-xs text-gray-500">Discipline: {horse.discipline.join(', ')}</p>
+                </div>
+                <div className="flex flex-col space-y-1">
+                  <button onClick={() => handleEdit(horse)} className="px-2 py-1 text-xs rounded-md bg-yellow-100 text-yellow-800 hover:bg-yellow-200">Edit</button>
+                  <button onClick={() => handleDelete(horse.id)} className="px-2 py-1 text-xs rounded-md bg-red-100 text-red-800 hover:bg-red-200">Delete</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// Goal Tracking Component
+const GoalTracking = ({ showMessage }) => {
+  const { currentUser, currentUserProfile, db } = useAuth();
+  const [goals, setGoals] = useState([]);
+  const [newGoal, setNewGoal] = useState({ title: '', description: '', targetDate: '', associatedHorse: '', progress: 'Not Started', category: '' });
+  const [horses, setHorses] = useState([]);
+
+  useEffect(() => {
+    if (currentUser && currentUserProfile?.barnId) {
+      const qHorses = query(collection(db, `barns/${currentUserProfile.barnId}/horses`));
+      const unsubscribeHorses = onSnapshot(qHorses, (snapshot) => {
+        setHorses(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+      });
+
+      const qGoals = query(collection(db, `barns/${currentUserProfile.barnId}/goals`));
+      const unsubscribeGoals = onSnapshot(qGoals, (snapshot) => {
+        setGoals(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+      });
+
+      return () => { unsubscribeHorses(); unsubscribeGoals(); };
+    } else {
+      setHorses([]);
+      setGoals([]);
+    }
+  }, [currentUser, currentUserProfile, db, showMessage]);
+
+  const handleInputChange = (e) => {
+    const { name, value } = e.target;
+    setNewGoal({ ...newGoal, [name]: value });
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!currentUser || !currentUserProfile?.barnId) {
+      showMessage("Please log in and ensure your barn is set up.", "error");
+      return;
+    }
+
+    // Check free tier limit for goals
+    if (currentUserProfile.subscriptionStatus === 'free' && goals.length >= 3) {
+      showMessage("Free tier is limited to 3 active goals. Upgrade to Premium for unlimited goals.", "info");
+      return;
+    }
+
+    try {
+      await addDoc(collection(db, `barns/${currentUserProfile.barnId}/goals`), { ...newGoal, userId: currentUser.uid, createdAt: new Date() });
+      showMessage('Goal added successfully!', 'success');
+      setNewGoal({ title: '', description: '', targetDate: '', associatedHorse: '', progress: 'Not Started', category: '' });
+    } catch (error) {
+      console.error('Error saving goal:', error);
+      showMessage(`Failed to save goal: ${error.message}`, 'error');
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <h2 className="text-3xl font-bold text-[#8B4513] mb-2">🎯 Goal Tracking</h2>
+      <p className="text-gray-500 mb-8">Create and track riding and training goals for each horse.</p>
+
+      {currentUserProfile?.subscriptionStatus === 'free' && (
+        <div className="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-4 mb-4 rounded-md">
+          <p className="font-bold">Free Tier Limitation:</p>
+          <p>You can add up to 3 active goals in the Free tier. Upgrade to Premium for unlimited goals.</p>
+        </div>
+      )}
+
+      <div className="bg-white p-6 rounded-xl shadow-md">
+        <h3 className="text-xl font-semibold text-gray-800 mb-3">Add New Goal</h3>
+        <form onSubmit={handleSubmit} className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label htmlFor="title" className="block text-sm font-medium text-gray-700">Goal Title</label>
+            <input type="text" id="title" name="title" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newGoal.title} onChange={handleInputChange} required />
+          </div>
+          <div>
+            <label htmlFor="associatedHorse" className="block text-sm font-medium text-gray-700">Associated Horse</label>
+            <select id="associatedHorse" name="associatedHorse" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newGoal.associatedHorse} onChange={handleInputChange}>
+              <option value="">Select Horse</option>
+              {horses.map(horse => (
+                <option key={horse.id} value={horse.name}>{horse.name}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label htmlFor="targetDate" className="block text-sm font-medium text-gray-700">Target Date</label>
+            <input type="date" id="targetDate" name="targetDate" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newGoal.targetDate} onChange={handleInputChange} />
+          </div>
+          <div>
+            <label htmlFor="category" className="block text-sm font-medium text-gray-700">Category</label>
+            <select id="category" name="category" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newGoal.category} onChange={handleInputChange}>
+              <option value="">Select Category</option>
+              <option value="Training">Training</option>
+              <option value="Fitness">Fitness</option>
+              <option value="Competition">Competition</option>
+              <option value="Health">Health</option>
+            </select>
+          </div>
+          <div className="md:col-span-2">
+            <label htmlFor="description" className="block text-sm font-medium text-gray-700">Description</label>
+            <textarea id="description" name="description" rows="3" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newGoal.description} onChange={handleInputChange}></textarea>
+          </div>
+          <div className="md:col-span-2">
+            <button type="submit" className="w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-[#2E8B57] hover:bg-[#228B22]">Add Goal</button>
+          </div>
+        </form>
+      </div>
+
+      <div className="bg-white p-6 rounded-xl shadow-md">
+        <h3 className="text-xl font-semibold text-gray-800 mb-3">Your Goals</h3>
+        {goals.length === 0 ? (
+          <p className="text-gray-600">No goals added yet.</p>
+        ) : (
+          <div className="space-y-4">
+            {goals.map(goal => (
+              <div key={goal.id} className="border rounded-lg p-4 bg-green-50">
+                <p className="font-semibold text-green-800">{goal.title} ({goal.associatedHorse})</p>
+                <p className="text-sm text-green-600">{goal.description}</p>
+                <p className="text-xs text-gray-500 mt-1">Target: {goal.targetDate} | Progress: {goal.progress} | Category: {goal.category}</p>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// Care Tracking Component
+const CareTracking = ({ showMessage }) => {
+  const { currentUser, currentUserProfile, db } = useAuth();
+  const [careEvents, setCareEvents] = useState([]);
+  const [newCareEvent, setNewCareEvent] = useState({
+    eventType: '', date: '', practitioner: '', description: '', cost: '', nextDueDate: '', associatedHorse: ''
+  });
+  const [horses, setHorses] = useState([]);
+
+  useEffect(() => {
+    if (currentUser && currentUserProfile?.barnId) {
+      const qHorses = query(collection(db, `barns/${currentUserProfile.barnId}/horses`));
+      const unsubscribeHorses = onSnapshot(qHorses, (snapshot) => {
+        setHorses(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+      });
+
+      const qCare = query(collection(db, `barns/${currentUserProfile.barnId}/careRecords`));
+      const unsubscribeCare = onSnapshot(qCare, (snapshot) => {
+        setCareEvents(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+      });
+
+      return () => { unsubscribeHorses(); unsubscribeCare(); };
+    } else {
+      setHorses([]);
+      setCareEvents([]);
+    }
+  }, [currentUser, currentUserProfile, db, showMessage]);
+
+  const handleInputChange = (e) => {
+    const { name, value } = e.target;
+    setNewCareEvent({ ...newCareEvent, [name]: value });
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!currentUser || !currentUserProfile?.barnId) {
+      showMessage("Please log in and ensure your barn is set up.", "error");
+      return;
+    }
+
+    // Check free tier limit for care entries (e.g., 5 per month)
+    // This would require more complex Firestore queries and potentially Cloud Functions for monthly resets.
+    // For now, it's a conceptual limit.
+    if (currentUserProfile.subscriptionStatus === 'free' && careEvents.length >= 5) { // Simplified check
+        showMessage("Free tier is limited to 5 care entries. Upgrade to Premium for unlimited entries.", "info");
+        return;
+    }
+
+    try {
+      await addDoc(collection(db, `barns/${currentUserProfile.barnId}/careRecords`), { ...newCareEvent, userId: currentUser.uid, createdAt: new Date() });
+      showMessage('Care event added successfully!', 'success');
+      setNewCareEvent({ eventType: '', date: '', practitioner: '', description: '', cost: '', nextDueDate: '', associatedHorse: '' });
+    } catch (error) {
+      console.error('Error saving care event:', error);
+      showMessage(`Failed to save care event: ${error.message}`, 'error');
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <h2 className="text-3xl font-bold text-[#8B4513] mb-2">❤️ Care & Cost Tracking</h2>
+      <p className="text-gray-500 mb-8">Manage and track all care tasks and associated costs for your horses.</p>
+
+      {currentUserProfile?.subscriptionStatus === 'free' && (
+        <div className="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-4 mb-4 rounded-md">
+          <p className="font-bold">Free Tier Limitation:</p>
+          <p>Care and cost entries are limited in the Free tier. Upgrade to Premium for unlimited tracking.</p>
+        </div>
+      )}
+
+      <div className="bg-white p-6 rounded-xl shadow-md">
+        <h3 className="text-xl font-semibold text-gray-800 mb-3">Log New Care Event</h3>
+        <form onSubmit={handleSubmit} className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label htmlFor="associatedHorse" className="block text-sm font-medium text-gray-700">Associated Horse</label>
+            <select id="associatedHorse" name="associatedHorse" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newCareEvent.associatedHorse} onChange={handleInputChange} required>
+              <option value="">Select Horse</option>
+              {horses.map(horse => (
+                <option key={horse.id} value={horse.name}>{horse.name}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label htmlFor="eventType" className="block text-sm font-medium text-gray-700">Event Type</label>
+            <select id="eventType" name="eventType" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newCareEvent.eventType} onChange={handleInputChange} required>
+              <option value="">Select Type</option>
+              <option value="Vet Visit">Vet Visit</option>
+              <option value="Farrier">Farrier</option>
+              <option value="Deworming">Deworming</option>
+              <option value="Vaccination">Vaccination</option>
+              <option value="Dental">Dental</option>
+              <option value="Bodywork">Bodywork</option>
+              <option value="Grooming">Grooming</option>
+            </select>
+          </div>
+          <div>
+            <label htmlFor="date" className="block text-sm font-medium text-gray-700">Date of Event</label>
+            <input type="date" id="date" name="date" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newCareEvent.date} onChange={handleInputChange} required />
+          </div>
+          <div>
+            <label htmlFor="practitioner" className="block text-sm font-medium text-gray-700">Practitioner/Provider</label>
+            <input type="text" id="practitioner" name="practitioner" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newCareEvent.practitioner} onChange={handleInputChange} />
+          </div>
+          <div>
+            <label htmlFor="cost" className="block text-sm font-medium text-gray-700">Cost ($)</label>
+            <input type="number" id="cost" name="cost" step="0.01" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newCareEvent.cost} onChange={handleInputChange} />
+          </div>
+          <div>
+            <label htmlFor="nextDueDate" className="block text-sm font-medium text-gray-700">Next Due Date (Optional)</label>
+            <input type="date" id="nextDueDate" name="nextDueDate" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newCareEvent.nextDueDate} onChange={handleInputChange} />
+          </div>
+          <div className="md:col-span-2">
+            <label htmlFor="description" className="block text-sm font-medium text-gray-700">Description/Notes</label>
+            <textarea id="description" name="description" rows="3" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newCareEvent.description} onChange={handleInputChange}></textarea>
+          </div>
+          <div className="md:col-span-2">
+            <button type="submit" className="w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-[#4682B4] hover:bg-[#366792]">Log Care Event</button>
+          </div>
+        </form>
+      </div>
+
+      <div className="bg-white p-6 rounded-xl shadow-md">
+        <h3 className="text-xl font-semibold text-gray-800 mb-3">Upcoming Care & Costs</h3>
+        {careEvents.length === 0 ? (
+          <p className="text-gray-600">No care events logged yet.</p>
+        ) : (
+          <div className="space-y-4">
+            {careEvents.map(event => (
+              <div key={event.id} className="border rounded-lg p-4 bg-purple-50">
+                <p className="font-semibold text-purple-800">{event.eventType} for {event.associatedHorse}</p>
+                <p className="text-sm text-purple-600">Date: {event.date} {event.practitioner && `| By: ${event.practitioner}`}</p>
+                {event.cost && <p className="text-sm text-purple-600">Cost: ${parseFloat(event.cost).toFixed(2)}</p>}
+                {event.nextDueDate && <p className="text-sm text-purple-600">Next Due: {event.nextDueDate}</p>}
+                {event.description && <p className="text-xs text-gray-500 mt-1">{event.description}</p>}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// Ride Tracking Component (Manual Entry Focused)
+const RideTracking = ({ showMessage }) => {
+  const { currentUser, currentUserProfile, db } = useAuth();
+  const [rides, setRides] = useState([]);
+  const [newRide, setNewRide] = useState({
+    date: '', time: '', duration: '', distance: '', weather: '', gaits: [], turns: '', notes: '', associatedHorse: ''
+  });
+  const [horses, setHorses] = useState([]);
+  const [isGpsTracking, setIsGpsTracking] = useState(false);
+  const [gpsData, setGpsData] = useState([]);
+  const [watchId, setWatchId] = useState(null);
+
+  useEffect(() => {
+    if (currentUser && currentUserProfile?.barnId) {
+      const qHorses = query(collection(db, `barns/${currentUserProfile.barnId}/horses`));
+      const unsubscribeHorses = onSnapshot(qHorses, (snapshot) => {
+        setHorses(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+      });
+
+      const qRides = query(collection(db, `barns/${currentUserProfile.barnId}/rides`));
+      const unsubscribeRides = onSnapshot(qRides, (snapshot) => {
+        setRides(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+      });
+
+      return () => { unsubscribeHorses(); unsubscribeRides(); };
+    } else {
+      setHorses([]);
+      setRides([]);
+    }
+  }, [currentUser, currentUserProfile, db, showMessage]);
+
+  const handleInputChange = (e) => {
+    const { name, value, type, options } = e.target;
+    if (type === 'select-multiple') {
+      const selectedOptions = Array.from(options).filter(option => option.selected).map(option => option.value);
+      setNewRide({ ...newRide, [name]: selectedOptions });
+    } else {
+      setNewRide({ ...newRide, [name]: value });
+    }
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!currentUser || !currentUserProfile?.barnId) {
+      showMessage("Please log in and ensure your barn is set up.", "error");
+      return;
+    }
+    try {
+      await addDoc(collection(db, `barns/${currentUserProfile.barnId}/rides`), { ...newRide, userId: currentUser.uid, createdAt: new Date() });
+      showMessage('Ride logged successfully!', 'success');
+      setNewRide({ date: '', time: '', duration: '', distance: '', weather: '', gaits: [], turns: '', notes: '', associatedHorse: '' });
+    } catch (error) {
+      console.error('Error saving ride:', error);
+      showMessage(`Failed to save ride: ${error.message}`, 'error');
+    }
+  };
+
+  const startGpsTracking = () => {
+    if (currentUserProfile.subscriptionStatus === 'free') {
+      showMessage("GPS Ride Tracking is a Premium feature. Please upgrade your subscription.", "info");
+      return;
+    }
+    if (!navigator.geolocation) {
+      showMessage("Geolocation is not supported by your browser.", "error");
+      return;
+    }
+    showMessage("Starting GPS tracking...", "info");
+    setIsGpsTracking(true);
+    setGpsData([]);
+    const id = navigator.geolocation.watchPosition(
+      (position) => {
+        setGpsData((prev) => [...prev, {
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+          timestamp: new Date().toISOString(),
+          speed: position.coords.speed, // Speed in meters/second
+          altitude: position.coords.altitude // Altitude in meters
+        }]);
+      },
+      (error) => {
+        console.error("GPS error:", error);
+        showMessage(`GPS tracking error: ${error.message}`, "error");
+        setIsGpsTracking(false);
+      },
+      { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
+    );
+    setWatchId(id);
+  };
+
+  const stopGpsTracking = async () => {
+    if (watchId) {
+      navigator.geolocation.clearWatch(watchId);
+      setWatchId(null);
+    }
+    setIsGpsTracking(false);
+    showMessage("GPS tracking stopped. Saving ride data...", "info");
+
+    if (gpsData.length > 1) {
+      // Calculate distance and duration from GPS data
+      let totalDistance = 0; // in meters
+      let startTime = new Date(gpsData[0].timestamp).getTime();
+      let endTime = new Date(gpsData[gpsData.length - 1].timestamp).getTime();
+      let durationMinutes = (endTime - startTime) / (1000 * 60);
+
+      for (let i = 1; i < gpsData.length; i++) {
+        const p1 = gpsData[i - 1];
+        const p2 = gpsData[i];
+        // Haversine formula for distance between two lat/lon points
+        const R = 6371e3; // metres
+        const φ1 = p1.latitude * Math.PI / 180; // φ, λ in radians
+        const φ2 = p2.latitude * Math.PI / 180;
+        const Δφ = (p2.latitude - p1.latitude) * Math.PI / 180;
+        const Δλ = (p2.longitude - p1.longitude) * Math.PI / 180;
+
+        const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+                  Math.cos(φ1) * Math.cos(φ2) *
+                  Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+        totalDistance += R * c; // in metres
+      }
+
+      const distanceKm = (totalDistance / 1000).toFixed(2); // Convert to km
+      const distanceMiles = (totalDistance / 1609.34).toFixed(2); // Convert to miles
+
+      try {
+        await addDoc(collection(db, `barns/${currentUserProfile.barnId}/rides`), {
+          date: new Date().toISOString().slice(0, 10),
+          time: new Date().toTimeString().slice(0, 5),
+          duration: durationMinutes.toFixed(0),
+          distance: distanceMiles, // Store in miles for consistency with UI
+          weather: 'N/A (GPS)', // Weather API integration needed here
+          gaits: [], // Could infer from speed data with more complex logic
+          turns: '', // Could infer from GPS path with more complex logic
+          notes: 'GPS Tracked Ride',
+          associatedHorse: newRide.associatedHorse || 'Unknown Horse', // Prompt user to select horse after stopping
+          gpsPath: gpsData.map(p => ({ lat: p.latitude, lng: p.longitude })), // Store simplified path
+          userId: currentUser.uid,
+          createdAt: new Date()
+        });
+        showMessage('GPS Ride logged successfully!', 'success');
+      } catch (error) {
+        console.error('Error saving GPS ride:', error);
+        showMessage(`Failed to save GPS ride: ${error.message}`, 'error');
+      }
+    } else {
+      showMessage("No sufficient GPS data to save ride.", "info");
+    }
+    setGpsData([]);
+  };
+
+  return (
+    <div className="space-y-6">
+      <h2 className="text-3xl font-bold text-[#8B4513] mb-2">🐎 Ride Tracking</h2>
+      <p className="text-gray-500 mb-8">Log your rides manually or track them with GPS.</p>
+
+      {currentUserProfile?.subscriptionStatus === 'free' && (
+        <div className="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-4 mb-4 rounded-md">
+          <p className="font-bold">Free Tier Limitation:</p>
+          <p>GPS Ride Tracking is a Premium feature. Upgrade to Premium for real-time tracking, mapping, speed, and elevation data.</p>
+        </div>
+      )}
+
+      <div className="bg-white p-6 rounded-xl shadow-md">
+        <h3 className="text-xl font-semibold text-gray-800 mb-3">Log New Ride (Manual Entry)</h3>
+        <form onSubmit={handleSubmit} className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label htmlFor="associatedHorse" className="block text-sm font-medium text-gray-700">Associated Horse</label>
+            <select id="associatedHorse" name="associatedHorse" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newRide.associatedHorse} onChange={handleInputChange} required>
+              <option value="">Select Horse</option>
+              {horses.map(horse => (
+                <option key={horse.id} value={horse.name}>{horse.name}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label htmlFor="date" className="block text-sm font-medium text-gray-700">Date</label>
+            <input type="date" id="date" name="date" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newRide.date} onChange={handleInputChange} required />
+          </div>
+          <div>
+            <label htmlFor="time" className="block text-sm font-medium text-gray-700">Time</label>
+            <input type="time" id="time" name="time" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newRide.time} onChange={handleInputChange} />
+          </div>
+          <div>
+            <label htmlFor="duration" className="block text-sm font-medium text-gray-700">Duration (minutes)</label>
+            <input type="number" id="duration" name="duration" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newRide.duration} onChange={handleInputChange} />
+          </div>
+          <div>
+            <label htmlFor="distance" className="block text-sm font-medium text-gray-700">Distance (miles)</label>
+            <input type="number" id="distance" name="distance" step="0.1" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newRide.distance} onChange={handleInputChange} />
+          </div>
+          <div>
+            <label htmlFor="weather" className="block text-sm font-medium text-gray-700">Weather</label>
+            <select id="weather" name="weather" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newRide.weather} onChange={handleInputChange}>
+              <option value="">Select Weather</option>
+              <option value="Sunny">Sunny</option>
+              <option value="Cloudy">Cloudy</option>
+              <option value="Partly Cloudy">Partly Cloudy</option>
+              <option value="Rainy">Rainy</option>
+              <option value="Snowy">Snowy</option>
+            </select>
+          </div>
+          <div className="md:col-span-2">
+            <label htmlFor="gaits" className="block text-sm font-medium text-gray-700">Gaits Used</label>
+            <select id="gaits" name="gaits" multiple className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 h-24" value={newRide.gaits} onChange={handleInputChange}>
+              <option value="Walk">Walk</option>
+              <option value="Trot">Trot</option>
+              <option value="Canter">Canter</option>
+              <option value="Gallop">Gallop</option>
+              <option value="Lope">Lope</option>
+              <option value="Jog">Jog</option>
+            </select>
+            <p className="text-xs text-gray-500 mt-1">Hold Ctrl/Cmd to select multiple.</p>
+          </div>
+          <div className="md:col-span-2">
+            <label htmlFor="turns" className="block text-sm font-medium text-gray-700">Turns/Maneuvers</label>
+            <textarea id="turns" name="turns" rows="2" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newRide.turns} onChange={handleInputChange}></textarea>
+          </div>
+          <div className="md:col-span-2">
+            <label htmlFor="notes" className="block text-sm font-medium text-gray-700">Notes/Observations</label>
+            <textarea id="notes" name="notes" rows="3" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={newRide.notes} onChange={handleInputChange}></textarea>
+          </div>
+          <div className="md:col-span-2">
+            <button type="submit" className="w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-[#D2691E] hover:bg-[#A0522D]">Log Ride</button>
+          </div>
+        </form>
+      </div>
+
+      <div className="bg-white p-6 rounded-xl shadow-md">
+        <h3 className="text-xl font-semibold text-gray-800 mb-3">GPS Tracking</h3>
+        {!isGpsTracking ? (
+          <button
+            onClick={startGpsTracking}
+            className={`w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white ${currentUserProfile?.subscriptionStatus === 'free' ? 'bg-gray-400 cursor-not-allowed' : 'bg-[#2E8B57] hover:bg-[#228B22]'}`}
+            disabled={currentUserProfile?.subscriptionStatus === 'free'}
+          >
+            Start GPS Ride
+          </button>
+        ) : (
+          <button onClick={stopGpsTracking} className="w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-red-600 hover:bg-red-700">
+            Stop GPS Ride ({gpsData.length} points recorded)
+          </button>
+        )}
+        {isGpsTracking && (
+          <p className="text-sm text-gray-600 mt-2">Tracking active... {gpsData.length} points collected. (Map rendering not implemented in this version)</p>
+        )}
+      </div>
+
+      <div className="bg-white p-6 rounded-xl shadow-md">
+        <h3 className="text-xl font-semibold text-gray-800 mb-3">Your Logged Rides</h3>
+        {rides.length === 0 ? (
+          <p className="text-gray-600">No rides logged yet.</p>
+        ) : (
+          <div className="space-y-4">
+            {rides.map(ride => (
+              <div key={ride.id} className="border rounded-lg p-4 bg-yellow-50">
+                <p className="font-semibold text-yellow-800">Ride for {ride.associatedHorse} on {ride.date} at {ride.time}</p>
+                <p className="text-sm text-yellow-600">Duration: {ride.duration} mins | Distance: {ride.distance} miles</p>
+                <p className="text-xs text-gray-500 mt-1">Weather: {ride.weather} | Gaits: {ride.gaits.join(', ')}</p>
+                {ride.notes && <p className="text-xs text-gray-500 mt-1">Notes: {ride.notes}</p>}
+                {ride.gpsPath && (
+                  <p className="text-xs text-blue-600 mt-1">GPS Tracked (Path data available)</p>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// Milestones Component
+const Milestones = ({ showMessage }) => {
+  const { currentUserProfile, db } = useAuth();
+  const [earnedMilestones, setEarnedMilestones] = useState([]);
+
+  const allMilestones = [
+    { id: 'm1', title: 'First Ride', description: 'Log your very first ride in the app.' },
+    { id: 'm2', title: 'First Canter', description: 'Experience your horse\'s first canter under saddle.' },
+    { id: 'm3', title: 'First Trail Ride', description: 'Complete your first ride outside the arena.' },
+    { id: 'm4', title: 'First Show/Competition', description: 'Participate in your first equestrian event.' },
+    { id: 'm5', title: 'First Blue Ribbon', description: 'Earn a blue ribbon at a competition.' },
+    { id: 'm6', title: 'Completed 10 Rides', description: 'Log 10 rides in total.' },
+    { id: 'm7', title: 'Completed 50 Rides', description: 'Log 50 rides in total.' },
+    { id: 'm8', title: 'Completed 100 Miles', description: 'Ride a total of 100 miles (GPS or manual).' },
+    { id: 'm9', title: 'Completed 500 Miles', description: 'Ride a total of 500 miles (GPS or manual).' },
+    { id: 'm10', title: 'First Bareback Ride', description: 'Successfully ride your horse bareback.' },
+    { id: 'm11', title: 'First Time Jumping', description: 'Jump over your first crossrail or small obstacle.' },
+    { id: 'm12', title: 'First Water Crossing', description: 'Successfully cross water with your horse.' },
+    { id: 'm13', title: 'Mastered Simple Lead Change', description: 'Execute a clean simple lead change.' },
+    { id: 'm14', title: 'Mastered Flying Lead Change', description: 'Execute a clean flying lead change.' },
+    { id: 'm15', title: 'Completed First Dressage Test', description: 'Ride through and complete your first official dressage test.' },
+    { id: 'm16', title: 'Completed First Cross Country Course', description: 'Successfully navigate and complete your first cross country course.' },
+    { id: 'm17', title: 'First Time Hauling', description: 'Successfully load and transport your horse in a trailer.' },
+    { id: 'm18', title: 'First Time Clipping', description: 'Successfully clip a portion or all of your horse.' },
+    { id: 'm19', title: 'First Time Braiding', description: 'Successfully braid your horse\'s mane or tail for a show.' },
+    { id: 'm20', title: 'Successfully Administered Oral Medication', description: 'Give your horse oral medication without issue.' },
+    { id: 'm21', title: 'Successfully Administered Injections', description: 'Administer an injection to your horse (under vet guidance).' },
+    { id: 'm22', title: 'First Time Swimming with Horse', description: 'Enjoy a swim with your horse.' },
+    { id: 'm23', title: 'First Group Ride', description: 'Participate in a ride with multiple other riders.' },
+    { id: 'm24', title: 'Completed a 30-Day Training Block', description: 'Consistently train for 30 consecutive days.' },
+    { id: 'm25', title: 'Horse\'s First Birthday (since ownership)', description: 'Celebrate your horse\'s first birthday since you became their owner.' },
+  ];
+
+  useEffect(() => {
+    if (currentUserProfile?.userId) {
+      const q = query(collection(db, `users/${currentUserProfile.userId}/earnedMilestones`));
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        setEarnedMilestones(snapshot.docs.map(doc => doc.id)); // Store just the IDs of earned milestones
+      }, (error) => {
+        console.error("Error fetching earned milestones:", error);
+        showMessage("Error loading milestones.", "error");
+      });
+      return () => unsubscribe();
+    } else {
+      setEarnedMilestones([]);
+    }
+  }, [currentUserProfile, db, showMessage]);
+
+  const handleEarnMilestone = async (milestoneId) => {
+    if (!currentUserProfile?.userId) {
+      showMessage("Please log in to earn milestones.", "error");
+      return;
+    }
+    if (earnedMilestones.includes(milestoneId)) {
+      showMessage("You've already earned this milestone!", "info");
+      return;
+    }
+    try {
+      await setDoc(doc(db, `users/${currentUserProfile.userId}/earnedMilestones`, milestoneId), {
+        earnedAt: new Date(),
+        milestoneId: milestoneId
+      });
+      showMessage('Milestone earned! Congratulations!', 'success');
+    } catch (error) {
+      console.error('Error earning milestone:', error);
+      showMessage(`Failed to earn milestone: ${error.message}`, 'error');
+    }
+  };
+
+  const handleShareMilestone = (milestoneTitle) => {
+    if (currentUserProfile.subscriptionStatus === 'free') {
+      showMessage("Social sharing is a Premium feature. Please upgrade your subscription.", "info");
+      return;
+    }
+
+    if (navigator.share) {
+      navigator.share({
+        title: 'Stabled App Milestone!',
+        text: `I just earned the "${milestoneTitle}" milestone on the Stabled App! #StabledApp #EquestrianLife`,
+        url: window.location.href, // Link to the app
+      })
+      .then(() => console.log('Successful share'))
+      .catch((error) => console.log('Error sharing', error));
+    } else {
+      // Fallback for browsers that don't support Web Share API
+      const shareText = `I just earned the "${milestoneTitle}" milestone on the Stabled App! Check it out: ${window.location.href}`;
+      // Using document.execCommand('copy') for clipboard as navigator.clipboard.writeText() might not work in some iframe environments.
+      const el = document.createElement('textarea');
+      el.value = shareText;
+      document.body.appendChild(el);
+      el.select();
+      document.execCommand('copy');
+      document.body.removeChild(el);
+      showMessage("Sharing functionality is limited on this browser. Text copied to clipboard.", "info");
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <h2 className="text-3xl font-bold text-[#8B4513] mb-2">🏆 Milestones</h2>
+      <p className="text-gray-500 mb-8">Achieve and celebrate your riding journey with these milestones!</p>
+
+      {currentUserProfile?.subscriptionStatus === 'free' && (
+        <div className="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-4 mb-4 rounded-md">
+          <p className="font-bold">Free Tier Limitation:</p>
+          <p>You can view earned milestones, but social sharing is a Premium feature. Upgrade to Premium to share your achievements!</p>
+        </div>
+      )}
+
+      <div className="bg-white p-6 rounded-xl shadow-md">
+        <h3 className="text-xl font-semibold text-gray-800 mb-3">Your Milestones</h3>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {allMilestones.map(milestone => {
+            const isEarned = earnedMilestones.includes(milestone.id);
+            return (
+              <div key={milestone.id} className={`p-4 rounded-lg shadow-sm flex flex-col ${isEarned ? 'bg-green-100 border-green-500' : 'bg-gray-100 border-gray-300 opacity-60'}`}>
+                <div className="flex items-center mb-2">
+                  {isEarned ? (
+                    <svg className="w-6 h-6 text-green-600 mr-2" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd"></path></svg>
+                  ) : (
+                    <svg className="w-6 h-6 text-gray-400 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                  )}
+                  <h4 className={`font-semibold ${isEarned ? 'text-green-800' : 'text-gray-700'}`}>{milestone.title}</h4>
+                </div>
+                <p className={`text-sm ${isEarned ? 'text-green-700' : 'text-gray-600'}`}>{milestone.description}</p>
+                {currentUserProfile && ( // Only show buttons if user is logged in
+                  <div className="mt-auto pt-3 flex justify-end space-x-2">
+                    {!isEarned && (
+                      <button onClick={() => handleEarnMilestone(milestone.id)} className="px-3 py-1 text-xs rounded-md bg-blue-100 text-blue-800 hover:bg-blue-200">
+                        Mark Earned
+                      </button>
+                    )}
+                    {isEarned && (
+                      <button onClick={() => handleShareMilestone(milestone.title)} className={`px-3 py-1 text-xs rounded-md ${currentUserProfile.subscriptionStatus === 'free' ? 'bg-gray-200 text-gray-500 cursor-not-allowed' : 'bg-purple-100 text-purple-800 hover:bg-purple-200'}`} disabled={currentUserProfile.subscriptionStatus === 'free'}>
+                        Share
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// User Profile Component
+const Profile = ({ showMessage }) => {
+  const { currentUser, currentUserProfile, db, storage } = useAuth();
+  const [profileData, setProfileData] = useState({
+    name: '', bio: '', location: '', preferredDiscipline: '', ridingLevel: '', profileImageUrl: ''
+  });
+  const [profileImageFile, setProfileImageFile] = useState(null);
+
+  useEffect(() => {
+    if (currentUserProfile) {
+      setProfileData({
+        name: currentUserProfile.name || '',
+        bio: currentUserProfile.bio || '',
+        location: currentUserProfile.location || '',
+        preferredDiscipline: currentUserProfile.preferredDiscipline || '',
+        ridingLevel: currentUserProfile.ridingLevel || '',
+        profileImageUrl: currentUserProfile.profileImageUrl || ''
+      });
+    }
+  }, [currentUserProfile]);
+
+  const handleInputChange = (e) => {
+    const { name, value } = e.target;
+    setProfileData({ ...profileData, [name]: value });
+  };
+
+  const handleFileChange = (e) => {
+    if (e.target.files[0]) {
+      setProfileImageFile(e.target.files[0]);
+    }
+  };
+
+  const handleSaveProfile = async (e) => {
+    e.preventDefault();
+    if (!currentUser) {
+      showMessage("Please log in to edit your profile.", "error");
+      return;
+    }
+
+    try {
+      let imageUrl = profileData.profileImageUrl;
+      if (profileImageFile) {
+        const storageRef = ref(storage, `profile_images/${currentUser.uid}/${profileImageFile.name}_${Date.now()}`);
+        await uploadBytes(storageRef, profileImageFile);
+        imageUrl = await getDownloadURL(storageRef);
+      }
+
+      await setDoc(doc(db, 'users', currentUser.uid), {
+        ...profileData,
+        profileImageUrl: imageUrl,
+        updatedAt: new Date()
+      }, { merge: true });
+      showMessage('Profile updated successfully!', 'success');
+    } catch (error) {
+      console.error('Error saving profile:', error);
+      showMessage(`Failed to save profile: ${error.message}`, 'error');
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <h2 className="text-3xl font-bold text-[#8B4513] mb-2">👤 Your Profile</h2>
+      <p className="text-gray-500 mb-8">Manage your personal information and preferences.</p>
+
+      <div className="bg-white p-6 rounded-xl shadow-md">
+        <h3 className="text-xl font-semibold text-gray-800 mb-3">Edit Profile</h3>
+        <form onSubmit={handleSaveProfile} className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="md:col-span-2 flex flex-col items-center">
+            {profileData.profileImageUrl ? (
+              <img src={profileData.profileImageUrl} alt="Profile" className="h-32 w-32 rounded-full object-cover mb-4 border-2 border-[#D2691E]" />
+            ) : (
+              <div className="h-32 w-32 rounded-full bg-gray-200 flex items-center justify-center mb-4 text-gray-500 text-sm">No Image</div>
+            )}
+            <label htmlFor="profileImage" className="cursor-pointer px-4 py-2 bg-[#F5DEB3] text-[#8B4513] rounded-md hover:bg-[#EEDDBC] text-sm font-semibold">
+              Upload Profile Image
+              <input type="file" id="profileImage" name="profileImage" accept="image/*" className="hidden" onChange={handleFileChange} />
+            </label>
+          </div>
+          <div>
+            <label htmlFor="name" className="block text-sm font-medium text-gray-700">Name</label>
+            <input type="text" id="name" name="name" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={profileData.name} onChange={handleInputChange} />
+          </div>
+          <div>
+            <label htmlFor="location" className="block text-sm font-medium text-gray-700">Location</label>
+            <input type="text" id="location" name="location" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={profileData.location} onChange={handleInputChange} />
+          </div>
+          <div>
+            <label htmlFor="preferredDiscipline" className="block text-sm font-medium text-gray-700">Preferred Discipline</label>
+            <input type="text" id="preferredDiscipline" name="preferredDiscipline" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={profileData.preferredDiscipline} onChange={handleInputChange} />
+          </div>
+          <div>
+            <label htmlFor="ridingLevel" className="block text-sm font-medium text-gray-700">Riding Level</label>
+            <input type="text" id="ridingLevel" name="ridingLevel" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={profileData.ridingLevel} onChange={handleInputChange} />
+          </div>
+          <div className="md:col-span-2">
+            <label htmlFor="bio" className="block text-sm font-medium text-gray-700">Bio</label>
+            <textarea id="bio" name="bio" rows="3" className="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2" value={profileData.bio} onChange={handleInputChange}></textarea>
+          </div>
+          <div className="md:col-span-2">
+            <button type="submit" className="w-full inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-[#D2691E] hover:bg-[#A0522D]">Save Profile</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+// Subscription Component
+const Subscription = ({ showMessage }) => {
+  const { currentUser, currentUserProfile, db } = useAuth();
+  const [currentSubscription, setCurrentSubscription] = useState('free'); // 'free', 'premium_monthly', 'premium_annual'
+
+  useEffect(() => {
+    if (currentUserProfile?.subscriptionStatus) {
+      setCurrentSubscription(currentUserProfile.subscriptionStatus);
+    }
+  }, [currentUserProfile]);
+
+  const simulatePayment = async (tier) => {
+    if (!currentUser) {
+      showMessage("Please log in to manage subscriptions.", "error");
+      return;
+    }
+
+    showMessage(`Simulating payment for ${tier} subscription...`, 'info');
+    // In a real app, you would integrate with Stripe here:
+    // 1. Create a Stripe Checkout Session (server-side via Cloud Function)
+    // 2. Redirect user to Stripe Checkout
+    // 3. Handle Stripe Webhook for successful payment to update user's subscription status in Firestore
+    await new Promise(resolve => setTimeout(resolve, 2000)); // Simulate network delay
+
+    try {
+      let newStatus = 'free';
+      if (tier === 'monthly') {
+        newStatus = 'premium_monthly';
+      } else if (tier === 'annual') {
+        newStatus = 'premium_annual';
+      }
+
+      await setDoc(doc(db, 'users', currentUser.uid), {
+        subscriptionStatus: newStatus,
+        subscriptionStartDate: new Date(),
+        // In a real app, you'd store Stripe subscription IDs, next billing dates etc.
+      }, { merge: true });
+      showMessage(`Successfully subscribed to ${tier} plan!`, 'success');
+    } catch (error) {
+      console.error('Subscription error:', error);
+      showMessage(`Subscription failed: ${error.message}`, 'error');
+    }
+  };
+
+  const handleDowngrade = async () => {
+    if (!currentUser) return;
+    if (window.confirm("Are you sure you want to downgrade to the Free plan? Your premium features will be limited at the end of your current billing period.")) {
+      try {
+        await setDoc(doc(db, 'users', currentUser.uid), {
+          subscriptionStatus: 'free',
+          // In a real app, you'd cancel the Stripe subscription via a Cloud Function here
+        }, { merge: true });
+        showMessage('Downgrade successful. Features will be limited at end of current period.', 'success');
+      } catch (error) {
+        console.error('Downgrade error:', error);
+        showMessage(`Downgrade failed: ${error.message}`, 'error');
+      }
+    }
+  };
+
+  return (
+    <div className="space-y-6">
+      <h2 className="text-3xl font-bold text-[#8B4513] mb-2">💰 Subscription</h2>
+      <p className="text-gray-500 mb-8">Choose the plan that's right for you and your horse.</p>
+
+      <div className="bg-white p-6 rounded-xl shadow-md">
+        <h3 className="text-xl font-semibold text-gray-800 mb-3">Your Current Plan: <span className="font-bold text-[#D2691E]">{currentSubscription.toUpperCase().replace('_', ' ')}</span></h3>
+        
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-6">
+          {/* Free Tier */}
+          <div className={`p-6 rounded-xl shadow-md border-2 ${currentSubscription === 'free' ? 'border-[#2E8B57]' : 'border-gray-300'}`}>
+            <h4 className="text-2xl font-bold text-gray-800 mb-3">Free</h4>
+            <p className="text-gray-600 mb-4">Basic features to get started.</p>
+            <ul className="list-disc list-inside text-gray-700 mb-6 space-y-2 text-sm">
+              <li>1 Horse Profile</li>
+              <li>3 Active Goals</li>
+              <li>Limited Care & Cost Entries</li>
+              <li>Manual Ride Entry</li>
+              <li>View Milestones (no sharing)</li>
+            </ul>
+            {currentSubscription === 'free' ? (
+              <button disabled className="w-full px-4 py-2 bg-gray-300 text-gray-800 rounded-md cursor-not-allowed">Current Plan</button>
+            ) : (
+              <button onClick={handleDowngrade} className="w-full px-4 py-2 bg-red-500 text-white rounded-md hover:bg-red-600">Downgrade to Free</button>
+            )}
+          </div>
+
+          {/* Premium Monthly */}
+          <div className={`p-6 rounded-xl shadow-md border-2 ${currentSubscription === 'premium_monthly' ? 'border-[#2E8B57]' : 'border-gray-300'}`}>
+            <h4 className="text-2xl font-bold text-gray-800 mb-3">Premium Monthly</h4>
+            <p className="text-gray-600 text-lg font-semibold mb-4">$5 / month</p>
+            <ul className="list-disc list-inside text-gray-700 mb-6 space-y-2 text-sm">
+              <li>Unlimited Horses</li>
+              <li>Unlimited Goals</li>
+              <li>Unlimited Care & Cost</li>
+              <li>GPS Ride Tracking</li>
+              <li>All Milestones & Sharing</li>
+              <li>AI Insights (conceptual)</li>
+            </ul>
+            {currentSubscription === 'premium_monthly' ? (
+              <button disabled className="w-full px-4 py-2 bg-gray-300 text-gray-800 rounded-md cursor-not-allowed">Current Plan</button>
+            ) : (
+              <button onClick={() => simulatePayment('monthly')} className="w-full px-4 py-2 bg-[#2E8B57] text-white rounded-md hover:bg-[#228B22]">Choose Monthly</button>
+            )}
+          </div>
+
+          {/* Premium Annual */}
+          <div className={`p-6 rounded-xl shadow-md border-2 ${currentSubscription === 'premium_annual' ? 'border-[#2E8B57]' : 'border-gray-300'}`}>
+            <h4 className="text-2xl font-bold text-gray-800 mb-3">Premium Annual</h4>
+            <p className="text-gray-600 text-lg font-semibold mb-4">$50 / year <span className="text-sm text-green-600">(Save $10!)</span></p>
+            <ul className="list-disc list-inside text-gray-700 mb-6 space-y-2 text-sm">
+              <li>All Monthly features</li>
+              <li>Annual Discount</li>
+              <li>Priority Support</li>
+            </ul>
+            {currentSubscription === 'premium_annual' ? (
+              <button disabled className="w-full px-4 py-2 bg-gray-300 text-gray-800 rounded-md cursor-not-allowed">Current Plan</button>
+            ) : (
+              <button onClick={() => simulatePayment('annual')} className="w-full px-4 py-2 bg-[#2E8B57] text-white rounded-md hover:bg-[#228B22]">Choose Annually</button>
+            )}
+          </div>
+        </div>
+        <p className="text-xs text-gray-500 mt-4 text-center">Payment process is simulated for demonstration purposes. Real integration requires Stripe API and Firebase Cloud Functions.</p>
+      </div>
+    </div>
+  );
+};
+
+// Dashboard Component
+const Dashboard = ({ showMessage }) => {
+  const { currentUserProfile, db } = useAuth();
+  const [horseCount, setHorseCount] = useState(0);
+  const [rideCount, setRideCount] = useState(0);
+  const [milestoneCount, setMilestoneCount] = useState(0);
+
+  useEffect(() => {
+    if (currentUserProfile?.barnId) {
+      const fetchCounts = async () => {
+        // Fetch horse count
+        const horsesSnapshot = await getDocs(collection(db, `barns/${currentUserProfile.barnId}/horses`));
+        setHorseCount(horsesSnapshot.size);
+
+        // Fetch ride count
+        const ridesSnapshot = await getDocs(collection(db, `barns/${currentUserProfile.barnId}/rides`));
+        setRideCount(ridesSnapshot.size);
+
+        // Fetch milestone count
+        const milestonesSnapshot = await getDocs(collection(db, `users/${currentUserProfile.userId}/earnedMilestones`));
+        setMilestoneCount(milestonesSnapshot.size);
+      };
+      fetchCounts();
+    }
+  }, [currentUserProfile, db]);
+
+  return (
+    <div className="space-y-6">
+      <h2 className="text-3xl font-bold text-[#8B4513] mb-2">👑 Your Dashboard</h2>
+      <p className="text-gray-500 mb-8">A comprehensive overview of your riding journey.</p>
+      
+      <div className="bg-white p-6 rounded-xl shadow-md">
+        <h3 className="text-xl font-semibold text-gray-800 mb-3">Welcome, {currentUserProfile?.name || currentUserProfile?.email?.split('@')[0] || 'Rider'}!</h3>
+        <p className="text-gray-600">This is your personalized dashboard. Use the sidebar to navigate to different sections.</p>
+        <div className="mt-4">
+          <p className="text-gray-700">Your Role: <span className="font-semibold capitalize">{currentUserProfile?.role || 'Guest'}</span></p>
+          {currentUserProfile?.barnId && <p className="text-gray-700">Barn ID: <span className="font-semibold">{currentUserProfile.barnId}</span></p>}
+          <p className="text-gray-700">Subscription: <span className="font-semibold capitalize">{currentUserProfile?.subscriptionStatus?.replace('_', ' ') || 'Free'}</span></p>
+        </div>
+      </div>
+
+      <div className="bg-white p-6 rounded-xl shadow-md">
+        <h3 className="text-xl font-semibold text-gray-800 mb-3">Quick Stats</h3>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div className="p-4 bg-blue-50 rounded-lg">
+            <p className="text-sm text-blue-800 font-semibold">Total Horses</p>
+            <p className="text-2xl font-bold text-blue-900">{horseCount}</p>
+          </div>
+          <div className="p-4 bg-green-50 rounded-lg">
+            <p className="text-sm text-green-800 font-semibold">Logged Rides</p>
+            <p className="text-2xl font-bold text-green-900">{rideCount}</p>
+          </div>
+          <div className="p-4 bg-yellow-50 rounded-lg">
+            <p className="text-sm text-yellow-800 font-semibold">Earned Milestones</p>
+            <p className="text-2xl font-bold text-yellow-900">{milestoneCount}</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// App Overview Component
+const AppOverview = () => {
+  return (
+    <div className="space-y-6">
+      <h2 className="text-3xl font-bold text-[#8B4513] mb-2">Stabled: Application Overview</h2>
+      <p className="text-gray-500 mb-8">Discover how Stabled streamlines your riding management, offering an all-in-one platform for horses, goals, care, and rides.</p>
+      
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+        <div className="bg-white p-6 rounded-xl shadow-md border-l-4 border-[#D2691E]">
+            <h3 className="text-lg font-semibold text-gray-700">Centralized Data</h3>
+            <p className="text-gray-500 text-sm mt-1">Manage all horse, care, and riding data in one place.</p>
+        </div>
+         <div className="bg-white p-6 rounded-xl shadow-md border-l-4 border-[#2E8B57]">
+            <h3 className="text-lg font-semibold text-gray-700">Track Progress</h3>
+            <p className="text-gray-500 text-sm mt-1">Set and achieve goals, celebrate milestones.</p>
+        </div>
+         <div className="bg-white p-6 rounded-xl shadow-md border-l-4 border-[#4682B4]">
+            <h3 className="text-lg font-semibold text-gray-700">Stay Organized</h3>
+            <p className="text-gray-500 text-sm mt-1">Keep track of care events and costs effortlessly.</p>
+        </div>
+         <div className="bg-white p-6 rounded-xl shadow-md border-l-4 border-[#DAA520]">
+            <h3 className="text-lg font-semibold text-gray-700">Access Anywhere</h3>
+            <p className="text-gray-500 text-sm mt-1">Fully responsive design for seamless use on any device.</p>
+        </div>
+      </div>
+
+      <div className="bg-white p-6 rounded-xl shadow-md">
+        <h3 className="text-xl font-semibold text-gray-800 mb-3">Key Features</h3>
+        <ul className="list-disc list-inside text-gray-700 space-y-2">
+          <li>Detailed Horse Profiles with images.</li>
+          <li>Comprehensive Goal Tracking with progress.</li>
+          <li>Care & Cost Management with reminders.</li>
+          <li>Manual and GPS Ride Tracking (Premium).</li>
+          <li>Interactive Milestones with social sharing.</li>
+          <li>Personalized User Profiles.</li>
+          <li>Flexible Free and Paid Subscription Tiers.</li>
+        </ul>
+      </div>
+    </div>
+  );
+};
+
+// Main App Component
+const App = () => {
+  const { currentUser, loadingAuth } = useAuth();
+  const [currentHash, setCurrentHash] = useState(window.location.hash || '#app-overview');
+  const [sidebarOpen, setSidebarOpen] = useState(window.innerWidth >= 768);
+  const [message, setMessage] = useState('');
+  const [messageType, setMessageType] = useState('success');
+
+  const showMessage = (msg, type) => {
+    setMessage(msg);
+    setMessageType(type);
+  };
+
+  useEffect(() => {
+    const handleHashChange = () => {
+      setCurrentHash(window.location.hash || '#app-overview');
+    };
+    window.addEventListener('hashchange', handleHashChange);
+    return () => window.removeEventListener('hashchange', handleHashChange);
+  }, []);
+
+  useEffect(() => {
+    // Close sidebar on mobile when hash changes
+    if (window.innerWidth < 768) {
+      setSidebarOpen(false);
+    }
+  }, [currentHash]);
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      showMessage('Logged out successfully.', 'success');
+      window.location.hash = '#app-overview'; // Redirect to overview after logout
+    } catch (error) {
+      console.error('Logout error:', error);
+      showMessage(`Logout failed: ${error.message}`, 'error');
+    }
+  };
+
+  const renderContent = () => {
+    if (loadingAuth) {
+      return (
+        <div className="flex items-center justify-center h-full text-gray-600 text-lg">
+          Loading application...
+        </div>
+      );
+    }
+
+    if (!currentUser || !currentUser.uid) { // Check for currentUser.uid to ensure it's not an anonymous user trying to access restricted content
+      // Not logged in, show Auth page or App Overview
+      if (currentHash === '#app-overview') {
+        return <AppOverview />;
+      }
+      return <AuthPage showMessage={showMessage} />;
+    }
+
+    // Logged in user content
+    switch (currentHash) {
+      case '#dashboard':
+        return <Dashboard showMessage={showMessage} />;
+      case '#horses':
+        return <HorseManagement showMessage={showMessage} />;
+      case '#goals':
+        return <GoalTracking showMessage={showMessage} />;
+      case '#care':
+        return <CareTracking showMessage={showMessage} />;
+      case '#rides':
+        return <RideTracking showMessage={showMessage} />;
+      case '#milestones':
+        return <Milestones showMessage={showMessage} />;
+      case '#profile':
+        return <Profile showMessage={showMessage} />;
+      case '#subscription':
+        return <Subscription showMessage={showMessage} />;
+      case '#app-overview':
+        return <AppOverview />;
+      default:
+        // Default to dashboard if logged in, otherwise app-overview
+        return currentUser ? <Dashboard showMessage={showMessage} /> : <AppOverview />;
+    }
+  };
+
+  const navLinks = [
+    { href: '#dashboard', label: 'Dashboard', icon: (
+        <svg className="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zM14 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zM14 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z"></path></svg>
+    ), authRequired: true },
+    { href: '#horses', label: 'Horses', icon: (
+        <svg className="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6.253v11.494m-9-5.494h18"></path><path d="M16.5 6.253c-1.523 0-2.92.868-3.75 2.247m-7.5 0C4.42 7.12 2.977 6.253 1.5 6.253m15 0A9.003 9.003 0 003 6.253"></path></svg>
+    ), authRequired: true },
+    { href: '#goals', label: 'Goals', icon: (
+        <svg className="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"></path></svg>
+    ), authRequired: true },
+    { href: '#care', label: 'Care', icon: (
+        <svg className="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path></svg>
+    ), authRequired: true },
+    { href: '#rides', label: 'Rides', icon: (
+        <svg className="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+    ), authRequired: true },
+    { href: '#milestones', label: 'Milestones', icon: (
+        <svg className="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+    ), authRequired: true },
+    { href: '#profile', label: 'Profile', icon: (
+        <svg className="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
+    ), authRequired: true },
+    { href: '#subscription', label: 'Subscription', icon: (
+        <svg className="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 9V7a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-6a2 2 0 00-2-2H9a2 2 0 00-2 2v6a2 2 0 002 2zm7-5a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
+    ), authRequired: true },
+    { href: '#app-overview', label: 'App Overview', icon: (
+        <svg className="w-5 h-5 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+    ), authRequired: false }, // Always visible
+  ];
+
+  return (
+    <AuthProvider>
+      <div className="flex h-screen font-inter">
+        <MessageBox message={message} type={messageType} />
+
+        {/* Hamburger menu for mobile */}
+        <button onClick={() => setSidebarOpen(!sidebarOpen)} className="hamburger-menu fixed top-4 left-4 z-20 p-2 bg-[#D2691E] rounded-md md:hidden">
+          <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 12h16M4 18h16"></path></svg>
+        </button>
+
+        <aside className={`w-64 bg-[#FFF8E1] p-6 flex flex-col fixed h-full shadow-lg sidebar transform ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0 transition-transform duration-300 ease-in-out z-40`}>
+          <div className="flex items-center mb-10">
+            <div className="p-2 bg-[#D2691E] rounded-full mr-3">
+              <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"></path></svg>
+            </div>
+            <h1 className="text-xl font-bold text-[#8B4513]">Stabled</h1>
+          </div>
+          <nav className="flex flex-col space-y-2">
+            {navLinks.map(link => {
+              // Only show link if user is authenticated and link is auth-required, OR if link is not auth-required
+              const isLinkVisible = (currentUser && currentUser.uid && link.authRequired) || (!link.authRequired);
+              
+              if (!isLinkVisible) return null;
+
+              return (
+                <a 
+                  key={link.href} 
+                  href={link.href} 
+                  className={`nav-link p-3 rounded-lg flex items-center ${currentHash === link.href ? 'active' : ''}`}
+                  onClick={() => {
+                    setCurrentHash(link.href);
+                    if (window.innerWidth < 768) setSidebarOpen(false); // Close sidebar on mobile after click
+                  }}
+                >
+                  {link.icon}
+                  {link.label}
+                </a>
+              );
+            })}
+            {currentUser && currentUser.uid && ( // Only show logout if a non-anonymous user is logged in
+              <button onClick={handleLogout} className="w-full mt-4 py-2 px-4 bg-red-600 text-white rounded-md hover:bg-red-700">Logout</button>
+            )}
+          </nav>
+          <div className="mt-auto p-4 bg-[#F5DEB3] rounded-lg text-center">
+            <p className="text-sm text-[#8B4513]">Stabled: Your all-in-one riding companion.</p>
+          </div>
+        </aside>
+
+        <main className={`flex-1 p-8 overflow-y-auto main-content ${sidebarOpen ? 'md:ml-64' : 'md:ml-0'} transition-all duration-300 ease-in-out`}>
+          <div className="mb-8">
+            <input type="text" placeholder="Search across horses, goals, rides..." className="w-full rounded-md border-gray-300 shadow-sm focus:border-[#D2691E] focus:ring-[#D2691E] sm:text-sm p-3">
+            </input>
+          </div>
+          {renderContent()}
+        </main>
+      </div>
+    </AuthProvider>
+  );
+};
+
+export default App;
